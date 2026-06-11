@@ -89,16 +89,22 @@ class GatewayKanbanWatchersMixin:
         # task is genuinely done lets the cursor (advanced atomically by
         # claim_unseen_events_for_sub) handle dedup, and any retry-loop
         # event reaches the user.
-        # Per-subscription send-failure counter. Adapter.send can fail by
+        # Per-subscription send-failure state. Adapter.send can fail by
         # raising or by returning SendResult(success=False). Keep the
         # subscription and rewind claimed cursors on failures so terminal
         # blocked/completed notifications are retryable instead of silently
-        # consumed.
+        # consumed. After MAX_SEND_FAILURES consecutive failures the
+        # subscription enters exponential backoff (doubling per failure,
+        # capped at MAX_RETRY_DELAY) so a permanently dead chat (bot
+        # kicked, channel deleted) doesn't burn an adapter.send call and a
+        # warning line every tick forever — but is still retried, so the
+        # notification delivers if the chat ever recovers.
         MAX_SEND_FAILURES = 3
-        sub_fail_counts: dict[tuple, int] = getattr(
-            self, "_kanban_sub_fail_counts", {}
+        MAX_RETRY_DELAY = 3600.0
+        sub_fail_states: dict[tuple, dict] = getattr(
+            self, "_kanban_sub_fail_states", {}
         )
-        self._kanban_sub_fail_counts = sub_fail_counts
+        self._kanban_sub_fail_states = sub_fail_states
         notifier_profile = getattr(self, "_kanban_notifier_profile", None)
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
@@ -178,6 +184,17 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: subscription for %s on %s skipped; adapter not connected",
                                         sub.get("task_id"), platform or "<missing>",
                                     )
+                                    continue
+                                fail_state = sub_fail_states.get((
+                                    sub["task_id"], sub["platform"],
+                                    sub["chat_id"], sub.get("thread_id") or "",
+                                ))
+                                if fail_state and time.monotonic() < fail_state.get("next_retry_at", 0.0):
+                                    # Backoff window after repeated send
+                                    # failures: skip before claiming so the
+                                    # cursor is untouched and the tick is
+                                    # silent (no claim/rewind churn, no log
+                                    # spam for a dead chat).
                                     continue
                                 old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                     conn,
@@ -334,23 +351,38 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
-                            # Reset the failure counter on success.
-                            sub_fail_counts.pop(sub_key, None)
+                            # Reset the failure state on success.
+                            sub_fail_states.pop(sub_key, None)
                         except Exception as exc:
-                            fails = sub_fail_counts.get(sub_key, 0) + 1
-                            sub_fail_counts[sub_key] = fails
-                            logger.warning(
-                                "kanban notifier: send failed for %s on %s "
-                                "(attempt %d/%d): %s",
-                                sub["task_id"], platform_str, fails,
-                                MAX_SEND_FAILURES, exc,
-                            )
-                            if fails >= MAX_SEND_FAILURES:
+                            state = sub_fail_states.setdefault(sub_key, {})
+                            fails = state.get("fails", 0) + 1
+                            state["fails"] = fails
+                            if fails < MAX_SEND_FAILURES:
+                                # Transient-failure budget: retry on the
+                                # normal tick cadence.
                                 logger.warning(
-                                    "kanban notifier: keeping subscription "
-                                    "%s on %s after %d consecutive send failures; "
-                                    "cursor will be rewound for retry",
+                                    "kanban notifier: send failed for %s on %s "
+                                    "(attempt %d/%d): %s",
                                     sub["task_id"], platform_str, fails,
+                                    MAX_SEND_FAILURES, exc,
+                                )
+                            else:
+                                # Likely-dead chat: keep the subscription
+                                # (never silently consume a terminal
+                                # notification) but back off exponentially
+                                # so we don't hammer the adapter and the
+                                # log every tick forever.
+                                delay = min(
+                                    interval * (2 ** (fails - MAX_SEND_FAILURES + 1)),
+                                    MAX_RETRY_DELAY,
+                                )
+                                state["next_retry_at"] = time.monotonic() + delay
+                                logger.warning(
+                                    "kanban notifier: send failed for %s on %s "
+                                    "(%d consecutive failures): %s — keeping "
+                                    "subscription, next retry in %.0fs",
+                                    sub["task_id"], platform_str, fails, exc,
+                                    delay,
                                 )
                             await asyncio.to_thread(
                                 self._kanban_rewind,
