@@ -1,10 +1,13 @@
 import asyncio
+import re
 import time
 from pathlib import Path
 
 
 from gateway.config import Platform
+from gateway.platforms.base import MessageEvent
 from gateway.run import GatewayRunner
+from gateway.session import SessionSource
 from hermes_cli import kanban_db as kb
 
 
@@ -42,6 +45,30 @@ def _make_runner(adapter):
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._kanban_sub_fail_states = {}
     return runner
+
+
+def _make_kanban_slash_runner():
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._kanban_notifier_profile = "default"
+    return runner
+
+
+def _kanban_event(text, *, chat_id="chat-1", thread_id="topic-1"):
+    return MessageEvent(
+        text=text,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            user_id="user-1",
+        ),
+    )
+
+
+def _created_id(output):
+    match = re.search(r"\b(t_[0-9a-f]+)\b", output)
+    assert match, output
+    return match.group(1)
 
 
 def _create_completed_subscription(summary="done once"):
@@ -461,6 +488,114 @@ def test_live_parent_child_does_not_inherit_subscription(tmp_path, monkeypatch):
         assert kb.list_notify_subs(conn, child) == []
     finally:
         conn.close()
+
+
+def test_kanban_create_live_parent_child_does_not_report_subscription(tmp_path, monkeypatch):
+    db_path = tmp_path / "slash-live-parent-child-no-subscribe.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="live root", assignee="planner")
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="topic-1",
+            user_id="user-1",
+            notifier_profile="default",
+        )
+    finally:
+        conn.close()
+
+    runner = _make_kanban_slash_runner()
+    output = asyncio.run(
+        runner._handle_kanban_command(
+            _kanban_event(f"/kanban create 'ordinary child' --assignee worker --parent {root}")
+        )
+    )
+    child = _created_id(output)
+
+    assert "subscribed" not in output.lower()
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, child) == []
+    finally:
+        conn.close()
+
+
+def test_kanban_create_root_reports_repaired_subscription(tmp_path, monkeypatch):
+    db_path = tmp_path / "slash-root-subscribe.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    runner = _make_kanban_slash_runner()
+    output = asyncio.run(
+        runner._handle_kanban_command(
+            _kanban_event("/kanban create 'entry root' --assignee planner")
+        )
+    )
+    root = _created_id(output)
+
+    assert "subscribed" in output.lower()
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, root)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "chat-1"
+    assert subs[0]["thread_id"] == "topic-1"
+    assert subs[0]["notifier_profile"] == "default"
+
+
+def test_kanban_create_completed_parent_child_reports_inherited_subscription(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "slash-completed-parent-child-subscribe.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="done root", assignee="planner")
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="topic-1",
+            user_id="user-1",
+            notifier_profile="default",
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (root,))
+        assert kb.complete_task(conn, root, summary="root done")
+    finally:
+        conn.close()
+
+    runner = _make_kanban_slash_runner()
+    output = asyncio.run(
+        runner._handle_kanban_command(
+            _kanban_event(f"/kanban create 'follow up' --assignee worker --parent {root}")
+        )
+    )
+    child = _created_id(output)
+
+    assert "subscribed" in output.lower()
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, child)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "chat-1"
+    assert subs[0]["thread_id"] == "topic-1"
+    assert subs[0]["notifier_profile"] == "default"
 
 
 def test_repair_root_notify_sub_only_subscribes_roots_and_is_idempotent(tmp_path, monkeypatch):

@@ -364,25 +364,47 @@ class GatewaySlashCommandsMixin:
                     thread_id = str(getattr(source, "thread_id", "") or "")
                     user_id = str(getattr(source, "user_id", "") or "") or None
                     if platform_str and chat_id:
-                        def _sub():
+                        def _sub() -> bool:
                             from hermes_cli import kanban_db as _kb
                             conn = _kb.connect(board=requested_board)
                             try:
-                                _kb.repair_root_notify_sub(
+                                notifier_profile = (
+                                    getattr(self, "_kanban_notifier_profile", None)
+                                    or self._active_profile_name()
+                                )
+                                repaired_root = _kb.repair_root_notify_sub(
                                     conn, task_id=task_id,
                                     platform=platform_str, chat_id=chat_id,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
-                                    notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
+                                    notifier_profile=notifier_profile,
+                                )
+                                if repaired_root:
+                                    return True
+
+                                # Non-root create paths are deliberately narrower:
+                                # ordinary live-parent children are not exact
+                                # subscribed by the entry repair path. Only claim
+                                # success if another eligible path (for example a
+                                # post-completion follow-up inheriting its root's
+                                # row in create_task()) actually left an exact row
+                                # for this source chat/thread.
+                                expected_thread = thread_id or ""
+                                return any(
+                                    sub.get("platform") == platform_str
+                                    and str(sub.get("chat_id") or "") == chat_id
+                                    and str(sub.get("thread_id") or "") == expected_thread
+                                    for sub in _kb.list_notify_subs(conn, task_id)
                                 )
                             finally:
                                 conn.close()
-                        await asyncio.to_thread(_sub)
-                        output = (
-                            output.rstrip()
-                            + "\n"
-                            + t("gateway.kanban.subscribed_suffix", task_id=task_id)
-                        )
+                        subscribed = await asyncio.to_thread(_sub)
+                        if subscribed:
+                            output = (
+                                output.rstrip()
+                                + "\n"
+                                + t("gateway.kanban.subscribed_suffix", task_id=task_id)
+                            )
                 except Exception as exc:
                     logger.warning("kanban create auto-subscribe failed: %s", exc)
 
