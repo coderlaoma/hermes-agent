@@ -4113,6 +4113,27 @@ class TestApplyWalProbe:
                     pass
             assert not deleted_fds, f"stale deleted WAL/SHM FDs: {deleted_fds}"
 
+    def test_skips_all_journal_pragmas_when_wal_sidecar_exists(self, tmp_path):
+        """Existing WAL sidecars let live gateway ticks avoid flaky PRAGMA probes."""
+        import sqlite3
+        from hermes_state import apply_wal_with_fallback
+
+        class _JournalModeFails(sqlite3.Connection):
+            def execute(self, sql, params=()):
+                if "journal_mode" in sql.lower():
+                    raise sqlite3.OperationalError("disk I/O error")
+                return super().execute(sql, params)
+
+        db_path = tmp_path / "live.db"
+        db_path.touch()
+        (tmp_path / "live.db-wal").touch()
+
+        conn = sqlite3.connect(str(db_path), factory=_JournalModeFails)
+        try:
+            assert apply_wal_with_fallback(conn) == "wal"
+        finally:
+            conn.close()
+
     def test_fallback_to_delete_still_works(self, tmp_path):
         """When set-pragma raises a WAL-incompat error, falls back to DELETE."""
         import sqlite3
