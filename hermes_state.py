@@ -16,7 +16,6 @@ Key design decisions:
 
 import json
 import logging
-import os
 import random
 import re
 import sqlite3
@@ -229,37 +228,6 @@ def _on_disk_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
     return str(mode).strip().lower() if mode is not None else None
 
 
-def _sqlite_database_path(conn: sqlite3.Connection) -> Optional[str]:
-    """Return the main database path for *conn*, if SQLite exposes one."""
-    try:
-        row = conn.execute("PRAGMA database_list").fetchone()
-    except sqlite3.Error:
-        return None
-    if row is None or len(row) < 3:
-        return None
-    path = row[2]
-    return str(path) if path else None
-
-
-def _database_has_wal_sidecars(conn: sqlite3.Connection) -> bool:
-    """Best-effort check for existing WAL/SHM sidecars.
-
-    ``PRAGMA journal_mode`` is normally a read-only probe when the database is
-    already in WAL mode, but production traces have shown it can still raise
-    ``sqlite3.OperationalError: disk I/O error`` under live kanban gateway
-    contention even while the file's integrity checks remain healthy.  When the
-    sidecars already exist, treating the DB as WAL is safer than retrying the
-    set-pragma path on every dispatcher/warden tick.
-    """
-    db_path = _sqlite_database_path(conn)
-    if not db_path:
-        return False
-    try:
-        return os.path.exists(f"{db_path}-wal") or os.path.exists(f"{db_path}-shm")
-    except OSError:
-        return False
-
-
 def apply_wal_with_fallback(
     conn: sqlite3.Connection,
     *,
@@ -285,14 +253,6 @@ def apply_wal_with_fallback(
 
     Never downgrades to DELETE if the on-disk DB header reports WAL — see _on_disk_journal_mode.
     """
-    # Fast path: if WAL/SHM sidecars are already present, assume another
-    # connection/process has the DB in WAL mode and avoid issuing any
-    # journal_mode PRAGMA.  This prevents live gateway dispatcher/warden ticks
-    # from repeatedly hitting transient ``disk I/O error`` during PRAGMA
-    # journal_mode probes while the DB is otherwise healthy.
-    if _database_has_wal_sidecars(conn):
-        return "wal"
-
     # Read-only probe — no flock, no checkpoint, no WAL/SHM unlink.
     # Skipping the set-pragma prevents WAL-init from unlinking files other connections hold open.
     try:
